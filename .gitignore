@@ -1,0 +1,3 @@
+*.py[cod]
+local_settings.*
+tm_to_codegent/*.log
