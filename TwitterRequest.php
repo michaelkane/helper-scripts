@@ -1,43 +1,15 @@
+<?php namespace mkkane\TwitterRequest;
+
 /**
- * Send a signed request to Twitter using php curl
+ * Make basic requests to twitter
+ * ------------------------------
  *
- * Examples
- * ========
+ * This is a pretty old library, I originally made it for 4music.
  *
- * Basic Search:
- * 
- *   $tr = new TwitterRequest('GET', '/search/tweets.json');
- *   
- *   $tr->consumer_key = $app['consumer_key'];
- *   $tr->consumer_secret = $app['consumer_secret'];
- *   $tr->access_token = $user['access_token'];
- *   $tr->access_token_secret = $user['access_token_secret'];
+ * Relies on curl.  Should be re-written to have a friendlier api.
  *
- *   $tr->parameters['q'] = 'from:@stephenfry';
- *   $tr->parameters['count'] = 10;
- *   $tr->parameters['result_type'] = 'recent';
- *   $tr->parameters['include_entities'] = '1';
- *
- *   $tr->raise_exception_on_curl_error = true;
- *
- *   // Get data from twitter
- *   $tr->get_response();
- *
- *   // Have a look
- *   var_dump($tr->response->body);
- * 
- * 
- * Status Post:
- *
- *   $tr = new TwitterRequest('POST', '/status/update.json');
- *   
- *   $tr->consumer_key = $app['consumer_key'];
- *   $tr->consumer_secret = $app['consumer_secret'];
- *   $tr->access_token = $user['access_token'];
- *   $tr->access_token_secret = $user['access_token_secret'];
- *   $tr->data = array('status' => 'hello there');
- *   $tr->get_response();
- *
+ * Could make use of a nice new library, but this works.
+ * -- mkk
  */
 class TwitterRequest
 {
@@ -49,10 +21,12 @@ class TwitterRequest
   public $access_token_secret = '';
 
   public $verb;
-  public $base_url;
+  public $url;
   public $headers = array();
   public $parameters = array();
   public $data = array();
+
+  public $do_multipart = false;
 
   public $response;
 
@@ -63,24 +37,55 @@ class TwitterRequest
    * Constructor
    *
    * @param string $verb Method verb -- GET or POST
-   * @param string $path Twitter API endpoint base path
-   *                     -- should begin with '/'
-   *                     -- not include any query params
+   * @param string $path Twitter API endpoint path
+   *                     -- should not include any query params
    * @return mixed
    */
-  function __construct($verb, $path) {
+  public function __construct($verb, $path)
+  {
     if (strpos($path, '?') !== false) {
       throw new TwitterRequestException('Path must not include query parameters');
     }
 
     $this->verb = $verb;
-    $this->base_url = TwitterRequest::$api_url . $path;
+    $this->url = TwitterRequest::$api_url . ((starts_with($path, '/')) ? $path : '/'.$path);
 
-    // Set the headers we always want
-    $this->headers['Expect'] = ''; // Hack to get past '100 continue' issue
-
-    $this->response = new STDClass;
+    $this->response = new TwitterResponse;
     $this->response->error = false;
+  }
+
+
+  /**
+   * Just quickly hacking a couple of helper contructors in here.
+   */
+  public static function get($path, $auth, $parameters=null)
+  {
+    $tr = new self('GET', $path);
+    $tr->consumer_key = $auth['consumer_key'];
+    $tr->consumer_secret = $auth['consumer_secret'];
+    $tr->access_token = $auth['access_token'];
+    $tr->access_token_secret = $auth['access_token_secret'];
+
+    if (!is_null($parameters))
+      $tr->parameters = $parameters;
+
+    return $tr->get_response();
+  }
+
+  public static function post($path, $auth, $data=null, $multipart=false)
+  {
+    $tr = new self('POST', $path);
+    $tr->consumer_key = $auth['consumer_key'];
+    $tr->consumer_secret = $auth['consumer_secret'];
+    $tr->access_token = $auth['access_token'];
+    $tr->access_token_secret = $auth['access_token_secret'];
+
+    if (!is_null($data))
+      $tr->data = $data;
+
+    $tr->do_multipart=$multipart;
+
+    return $tr->get_response();
   }
 
 
@@ -89,7 +94,8 @@ class TwitterRequest
    *
    * @return object | false
    */
-  public function get_response() {
+  public function get_response()
+  {
     // Ensure we have authentication details
     if (
       !$this->consumer_key
@@ -100,7 +106,8 @@ class TwitterRequest
       throw new TwitterRequestException('Twitter authentication details must be set');
     }
 
-    $url = $this->base_url;
+    $url = $this->url;
+    $this->headers['Expect'] = ''; // Hack to get past '100 continue' issue
 
     // Query Params
     $query = '';
@@ -141,8 +148,12 @@ class TwitterRequest
         case 'GET': break;
         case 'POST':
           curl_setopt($curl, CURLOPT_POST, true);
-          if ($this->data !== false)
-            curl_setopt($curl, CURLOPT_POSTFIELDS, self::encode_post_data($this->data));
+          if ($this->data) {
+            if ($this->do_multipart)
+              curl_setopt($curl, CURLOPT_POSTFIELDS, $this->data);
+            else
+              curl_setopt($curl, CURLOPT_POSTFIELDS, self::encode_post_data($this->data));
+          }
           break;
         default: break;
       }
@@ -182,8 +193,12 @@ class TwitterRequest
    * @param string &$data Data
    * @return integer
    */
-  private function __responseWriteCallback(&$curl, &$data) {
-    $this->response->raw_body = $data;
+  private function __responseWriteCallback(&$curl, &$data)
+  {
+    if (!isset($this->response->raw_body))
+      $this->response->raw_body = '';
+
+    $this->response->raw_body .= $data;
     return strlen($data);
   }
 
@@ -195,7 +210,8 @@ class TwitterRequest
    * @param string &$data Data
    * @return integer
    */
-  private function __responseHeaderCallback(&$curl, &$data) {
+  private function __responseHeaderCallback(&$curl, &$data)
+  {
     if (($strlen = strlen($data)) <= 2) return $strlen;
     if (substr($data, 0, 4) == 'HTTP')
       $this->response->code = (int)substr($data, 9, 3);
@@ -235,8 +251,13 @@ class TwitterRequest
 
   // See https://dev.twitter.com/docs/auth/creating-signature
   private function generate_oauth_signature($oauth_params) {
-    // all oauth params, query params, and post data need to be signed
-    $all_key_vals = $oauth_params + $this->parameters + $this->data;
+    // All oauth params need to be signed
+    $all_key_vals = $oauth_params;
+
+    // If it's not a multipart file upload, then query params, and post data
+    // need to be signed too
+    if (!$this->do_multipart)
+      $all_key_vals += $this->parameters + $this->data;
 
     $all_key_vals_encoded = array();
     foreach ($all_key_vals as $key => $val)
@@ -251,7 +272,7 @@ class TwitterRequest
 
     $signature_base_string = strtoupper($this->verb)
       .'&'
-      .rawurlencode($this->base_url)
+      .rawurlencode($this->url)
       .'&'
       .rawurlencode($parameter_string);
 
@@ -290,9 +311,11 @@ class TwitterRequest
 
 }
 
+class TwitterResponse {}
 
-class TwitterRequestException extends Exception {
-  function __construct($message, $code = 0, Exception $previous = null) {
+class TwitterRequestException extends \Exception {
+  function __construct($message, $code = 0, \Exception $previous = null)
+  {
     parent::__construct($message, $code, $previous);
   }
 }
