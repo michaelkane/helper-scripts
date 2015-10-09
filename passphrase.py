@@ -1,3 +1,4 @@
+# Words from http://mieliestronk.com/corncob_lowercase.txt
 import random
 
 def main():
